@@ -1,0 +1,127 @@
+name: Daily Woods Finance Sync
+
+# Cron is UTC. ONE lean daily run — GitHub Actions minutes are shared across
+# the whole squinlan-bridge account (2,000/mo free; Bridge's syncs already use
+# ~1,400), so this workflow stays a single job (~3-5 min/run ≈ 150 min/mo).
+#
+# GitHub free-tier scheduled workflows run 1.5-2h late and are sometimes
+# dropped entirely (observed on Bridge). The Supabase pg_cron watchdog
+# (watchdog.sql) is the backstop: hourly staleness check + daily deadline
+# check fire workflow_dispatch when this cron doesn't deliver.
+#
+#   08:20 UTC ≈ 03:20 CDT — even with +2h lag, done well before the workday.
+on:
+  schedule:
+    - cron: '20 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  # ── QBO feeds (chart of accounts, expenses, budget) ─────────────────────
+  # All share the same OAuth token (Supabase-persisted). One job so token
+  # refresh happens once. Each connector wrapped with `continue-on-error:
+  # true` so a mid-job failure does NOT skip sibling steps — every heartbeat
+  # below still fires and records ok/error.
+  qbo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Chart of accounts FIRST — the expense sync resolves gl_codes from it,
+      # and the dashboard reads gl_accounts to render filters.
+      - name: Sync chart of accounts
+        id: sync-gl-accounts
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_gl_accounts_connector.py
+
+      - name: Heartbeat — gl_accounts
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OUTCOME:              ${{ steps.sync-gl-accounts.outcome }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            bash .github/scripts/heartbeat.sh gl_accounts ok "run $RUN_ID"
+          else
+            bash .github/scripts/heartbeat.sh gl_accounts error "run $RUN_ID outcome=$OUTCOME"
+          fi
+
+      - name: Sync expenses
+        id: sync-expenses
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_connector.py
+
+      - name: Heartbeat — expenses
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OUTCOME:              ${{ steps.sync-expenses.outcome }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            bash .github/scripts/heartbeat.sh expenses ok "run $RUN_ID"
+          else
+            bash .github/scripts/heartbeat.sh expenses error "run $RUN_ID outcome=$OUTCOME"
+          fi
+
+      - name: Sync budgets
+        id: sync-budget
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_budget_connector.py
+
+      - name: Heartbeat — budget
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OUTCOME:              ${{ steps.sync-budget.outcome }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            bash .github/scripts/heartbeat.sh budget ok "run $RUN_ID"
+          else
+            bash .github/scripts/heartbeat.sh budget error "run $RUN_ID outcome=$OUTCOME"
+          fi
+
+  # ── Freshness check — runs last, always. Fails the workflow if any feed is
+  # stale (age > threshold in the sync_freshness view) or errored, so a broken
+  # sync is visible in the Actions UI instead of silently serving stale data.
+  freshness-check:
+    needs: [qbo]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Freshness check
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: bash .github/scripts/check_freshness.sh
