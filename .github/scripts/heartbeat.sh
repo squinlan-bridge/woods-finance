@@ -6,6 +6,11 @@
 #   note:    optional free text
 set -euo pipefail
 
+# Secrets pasted into GitHub with a stray trailing newline break curl headers
+# with an opaque 400 — strip ALL whitespace defensively before use.
+SUPABASE_URL="$(printf '%s' "${SUPABASE_URL:-}" | tr -d '[:space:]')"
+SUPABASE_SERVICE_KEY="$(printf '%s' "${SUPABASE_SERVICE_KEY:-}" | tr -d '[:space:]')"
+
 FEED="${1:?feed name required}"
 STATUS="${2:-ok}"
 NOTE="${3:-workflow run ${GITHUB_RUN_ID:-manual}}"

@@ -5,6 +5,11 @@
 # migration `woods_initial_schema (20h threshold)`.
 set -euo pipefail
 
+# Secrets pasted into GitHub with a stray trailing newline break curl headers
+# with an opaque 400 — strip ALL whitespace defensively before use.
+SUPABASE_URL="$(printf '%s' "${SUPABASE_URL:-}" | tr -d '[:space:]')"
+SUPABASE_SERVICE_KEY="$(printf '%s' "${SUPABASE_SERVICE_KEY:-}" | tr -d '[:space:]')"
+
 : "${SUPABASE_URL:?SUPABASE_URL not set}"
 : "${SUPABASE_SERVICE_KEY:?SUPABASE_SERVICE_KEY not set}"
 

@@ -44,12 +44,12 @@ def _load_env_file(path=None):
 _load_env_file()
 
 # ── Config ─────────────────────────────────────────────────────────────────
-SUPABASE_URL  = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL  = os.environ.get("SUPABASE_URL", "").strip()
 # service_role key bypasses RLS; server-side only. anon fallback kept for parity.
-SUPABASE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY", "")
-CLIENT_ID     = os.environ.get("QBO_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET", "")
-COMPANY_ID    = os.environ.get("QBO_COMPANY_ID", "")
+SUPABASE_KEY  = (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY", "")).strip()
+CLIENT_ID     = os.environ.get("QBO_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET", "").strip()
+COMPANY_ID    = os.environ.get("QBO_COMPANY_ID", "").strip()
 TOKEN_FILE    = "qbo_tokens.json"
 
 QBO_BASE      = "https://quickbooks.api.intuit.com"
