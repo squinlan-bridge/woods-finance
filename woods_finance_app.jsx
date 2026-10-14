@@ -1218,6 +1218,12 @@ function BudgetPacingDashboard() {
   // dashboard sums when all months are selected, so the two reconcile.
   const monthsIncluded = Math.min(Math.ceil(monthsElapsed), 12);
 
+  // Escalation applied to prior-year REMAINING-months spend in the seasonal
+  // baseline below. Set at budget time (Shane, Oct 2026: 1.04 — inflation
+  // trending above 3%). A blanket factor, deliberately not a live CPI feed:
+  // precision here is worth ~$2K/yr and a feed is one more thing that breaks.
+  const PRIOR_YEAR_ESCALATION = 1.04;
+
   const projectAnnual = (actualYTD, prevYearMonthly) => {
     if (monthsElapsed <= 0) return { value: 0, method: "none" };
     const linear = (actualYTD / monthsElapsed) * 12;
@@ -1230,18 +1236,31 @@ function BudgetPacingDashboard() {
       for (let i = 0; i < fullMonths; i++) prevYTD += prevYearMonthly[i];
       if (fullMonths < 12) prevYTD += prevYearMonthly[fullMonths] * frac;
       const prevAnnual = prevYearMonthly.reduce((a, b) => a + b, 0);
+      // Seasonal baseline: this year's YTD plus what last year spent in the
+      // months still ahead, escalated. For a camp this beats straight-line as
+      // the low-confidence fallback — straight-line assumed the rest of the
+      // year looks like Jun–Oct, which understated winter-heavy GLs (propane,
+      // winter camps) and projected $0 for GLs with no spend yet (Oct 2026).
+      const prevRemaining = Math.max(0, prevAnnual - prevYTD);
+      const seasonal = actualYTD + prevRemaining * PRIOR_YEAR_ESCALATION;
       if (prevYTD > 0 && prevAnnual > 0) {
         // Confidence-weighted blend: the prior-year-shape ratio is only
         // trustworthy in proportion to how much of last year's annual spend
-        // had actually happened by this point in the year.
+        // had actually happened by this point in the year. Low confidence now
+        // falls back to the seasonal baseline, not straight-line.
         const priorShare   = prevYTD / prevAnnual;
         const elapsedShare = monthsElapsed / 12;
         const w = Math.min(1, priorShare / elapsedShare);
         const ratioProj = (actualYTD / prevYTD) * prevAnnual;
         return {
-          value: w * ratioProj + (1 - w) * linear,
+          value: w * ratioProj + (1 - w) * seasonal,
           method: w >= 0.95 ? "prior" : "blend",
         };
+      }
+      if (prevAnnual > 0) {
+        // Last year spent nothing by this point in the year (pure winter GL):
+        // no ratio to form — use the seasonal baseline outright.
+        return { value: seasonal, method: "seasonal" };
       }
     }
     return { value: linear, method: "linear" };
@@ -1424,7 +1443,7 @@ function BudgetPacingDashboard() {
       <div style={{ fontSize:10, color:"#4B5563", marginBottom:10 }}>
         Actuals sum across whole months that have begun ({monthsIncluded} of 12), matching the Expenses dashboard totals.{" "}
         {activeView === "forecast"
-          ? <>Forecast: take the ratio of current YTD to {prevFY} spend over the same day-prorated window ({monthsElapsed.toFixed(1)} mo), then apply to {prevFY} annual. When {prevFY}'s early-year spend on a GL is too small to trust its seasonal shape, the projection blends toward straight-line — flagged "blended". Pure straight-line when prior-year is empty — flagged "linear". Transactions marked one-time (1× on the Expenses Transactions tab) count toward YTD but are not extrapolated.</>
+          ? <>Forecast: take the ratio of current YTD to {prevFY} spend over the same day-prorated window ({monthsElapsed.toFixed(1)} mo), then apply to {prevFY} annual. When {prevFY}'s early-year spend on a GL is too small to trust its seasonal shape, the projection blends toward a seasonal baseline — this year's YTD plus {prevFY}'s remaining-months spend × {PRIOR_YEAR_ESCALATION.toFixed(2)} escalation — flagged "blended"; GLs with no {prevFY} spend in this window yet use that baseline outright — flagged "seasonal". Straight-line only when {prevFY} is empty — flagged "linear". Transactions marked one-time (1× on the Expenses Transactions tab) count toward YTD but are not extrapolated.</>
           : <>Expected YTD: distribute the annual budget across months using {prevFY}'s monthly shape, then sum through {monthsElapsed.toFixed(1)} months (day-prorated). Linear fallback (budget × elapsed ÷ 12) when prior-year is empty — flagged. Positive variance = spending faster than time-prorated pace.</>}
       </div>
       {monthsElapsed > 0 && monthsElapsed < 2 && (
@@ -1546,9 +1565,15 @@ function BudgetPacingDashboard() {
                                     </span>
                                   )}
                                   {r.projectedMethod === "blend" && (
-                                    <span title="Last year's spend on this GL was mostly later in the year, so its seasonal shape isn't reliable yet — projection is blended toward straight-line. Firms up as the year progresses."
+                                    <span title="Last year's spend on this GL was mostly later in the year, so its seasonal shape isn't reliable yet — projection is blended toward YTD + last year's remaining months (escalated). Firms up as the year progresses."
                                       style={{ padding:"1px 5px", background:"#9CA3AF22", border:"1px solid #9CA3AF44", borderRadius:3, fontSize:8, color:"#9CA3AF", fontWeight:600 }}>
                                       blended
+                                    </span>
+                                  )}
+                                  {r.projectedMethod === "seasonal" && (
+                                    <span title="No prior-year spend in this window yet (seasonal GL) — projected as YTD + last year's remaining-months spend, escalated"
+                                      style={{ padding:"1px 5px", background:"#4FD1A022", border:"1px solid #4FD1A044", borderRadius:3, fontSize:8, color:"#4FD1A0", fontWeight:600 }}>
+                                      seasonal
                                     </span>
                                   )}
                                 </span>
