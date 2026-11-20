@@ -23,6 +23,9 @@ since START_DATE, upserts on qbo_id, then deletes QBO-sourced rows that no
 longer exist upstream (deleted transactions, removed lines). Deletion only
 runs when every entity fetched cleanly and is capped by a safety threshold.
 
+Every row carries its QBO class (program) as a fully-qualified name, or
+NULL when the line is unclassified ("Not Specified" on QBO reports).
+
 There is NO hardcoded name→GL lookup table. The chart of accounts is resolved
 from the live Account list (AccountRef.value → AcctNum); expense-ness is
 decided by AccountType, not GL numbering.
@@ -418,6 +421,27 @@ def fetch_item_map():
     return item_map
 
 
+# ── Class mapping ──────────────────────────────────────────────────────────
+# QBO classes are the camp's programs (Summer Programs:150 High School Camp…).
+# ClassRef sits on each LINE; its .name is only the leaf, so resolve the id
+# to the fully-qualified name. ClassId → FullyQualifiedName.
+CLASS_MAP = {}
+
+
+def fetch_class_map():
+    rows = qbo_query("SELECT * FROM Class WHERE Active IN (true, false) MAXRESULTS 1000").get("Class", [])
+    return {c["Id"]: c.get("FullyQualifiedName") or c.get("Name", "") for c in rows}
+
+
+def resolve_class(detail, txn):
+    """Class name for a line: the line's ClassRef, else the transaction's.
+    None when unclassified (QBO reports show these as "Not Specified")."""
+    ref = (detail or {}).get("ClassRef") or txn.get("ClassRef") or {}
+    if not ref.get("value"):
+        return None
+    return CLASS_MAP.get(ref["value"]) or ref.get("name") or None
+
+
 # ── Transaction parsers ────────────────────────────────────────────────────
 def _txn_header(txn):
     """Common header fields, or None if the transaction has no usable date."""
@@ -435,7 +459,7 @@ def _txn_header(txn):
     }
 
 
-def _expense_record(qbo_id, hdr, account_ref, amount, vendor, line):
+def _expense_record(qbo_id, hdr, account_ref, amount, vendor, line, class_name=None):
     """Build one expenses row, or None if the line isn't an expense posting.
 
     `amount` is already signed (positive = expense, negative = credit).
@@ -477,6 +501,7 @@ def _expense_record(qbo_id, hdr, account_ref, amount, vendor, line):
         "amount":             amount,
         "vendor":             vendor,
         "memo":               line_desc or hdr["memo"] or None,
+        "class":              class_name,
         "source":             "QBO",
     }
 
@@ -499,13 +524,15 @@ def _parse_ap_txn(txn, kind, vendor_key, sign):
             account_ref = detail.get("AccountRef") or {}
         else:
             # Item-based line: the item's expense account takes the posting.
-            item_id = ((line.get("ItemBasedExpenseLineDetail") or {}).get("ItemRef") or {}).get("value")
+            detail = line.get("ItemBasedExpenseLineDetail") or {}
+            item_id = (detail.get("ItemRef") or {}).get("value")
             account_ref = (ITEM_MAP.get(item_id) or {}).get("expense") or {}
         if not account_ref:
             continue
         rec = _expense_record(
             f"{kind}_{hdr['id']}_{idx}", hdr, account_ref,
-            sign * float(line.get("Amount", 0) or 0), vendor, line)
+            sign * float(line.get("Amount", 0) or 0), vendor, line,
+            resolve_class(detail, txn))
         if rec:
             records.append(rec)
     return records
@@ -549,7 +576,8 @@ def parse_journal_entry(txn):
         rec = _expense_record(
             f"je_{hdr['id']}_{line.get('Id') or idx}", hdr,
             detail.get("AccountRef") or {},
-            sign * float(line.get("Amount", 0) or 0), vendor, line)
+            sign * float(line.get("Amount", 0) or 0), vendor, line,
+            resolve_class(detail, txn))
         if rec:
             records.append(rec)
     return records
@@ -577,7 +605,8 @@ def parse_deposit(txn):
         vendor = entity.get("name") or (entity.get("EntityRef") or {}).get("name") or "Deposit"
         rec = _expense_record(
             f"dep_{hdr['id']}_{line.get('Id') or idx}", hdr, account_ref,
-            -float(line.get("Amount", 0) or 0), vendor, line)
+            -float(line.get("Amount", 0) or 0), vendor, line,
+            resolve_class(detail, txn))
         if rec:
             records.append(rec)
     return records
@@ -597,13 +626,15 @@ def _parse_sales_txn(txn, prefix, sign):
     customer = (txn.get("CustomerRef") or {}).get("name", "Unknown")
     records = []
     for idx, line in enumerate(txn.get("Line", [])):
-        item_id = ((line.get("SalesItemLineDetail") or {}).get("ItemRef") or {}).get("value")
+        detail = line.get("SalesItemLineDetail") or {}
+        item_id = (detail.get("ItemRef") or {}).get("value")
         account_ref = (ITEM_MAP.get(item_id) or {}).get("income") or {}
         if not account_ref:
             continue
         rec = _expense_record(
             f"{prefix}_{hdr['id']}_{line.get('Id') or idx}", hdr, account_ref,
-            sign * float(line.get("Amount", 0) or 0), customer, line)
+            sign * float(line.get("Amount", 0) or 0), customer, line,
+            resolve_class(detail, txn))
         if rec:
             records.append(rec)
     return records
@@ -625,9 +656,10 @@ ENTITY_PARSERS = [
 
 def fetch_and_parse_all():
     """Pull every entity and parse to expense records. Raises on any failure."""
-    global ITEM_MAP
+    global ITEM_MAP, CLASS_MAP
     ITEM_MAP = fetch_item_map()
-    print(f"  → {len(ITEM_MAP)} items mapped")
+    CLASS_MAP = fetch_class_map()
+    print(f"  → {len(ITEM_MAP)} items, {len(CLASS_MAP)} classes mapped")
     all_records = []
     for entity, parser in ENTITY_PARSERS:
         txns = _fetch_entity(entity)
