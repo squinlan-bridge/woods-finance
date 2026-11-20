@@ -38,6 +38,20 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q libreoffice-calc
 
+      # Refresh the transaction feed first so the package's feed-vs-report
+      # reconciliation compares like with like (same-minute books), not this
+      # morning's sync against entries posted since. A failed refresh does not
+      # block the package; the reconciliation will simply show the drift.
+      - name: Refresh expenses feed
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_connector.py
+
       - name: Build, verify and upload the Woods package
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}

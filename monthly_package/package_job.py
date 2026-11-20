@@ -159,6 +159,9 @@ def main():
         if not verify(recalced, meta):
             print("✗ Package does not tie to QBO — NOT uploaded.", file=sys.stderr)
             return 1
+        rc = meta["recon"]
+        print(f"RECON: expenses feed vs QBO P&L — {rc['cells']} GL-months, {rc['exact']} exact, "
+              f"{len(rc['drift'])} over ${rc['threshold']:,.0f}")
         for flag in meta["flags"]:
             print(f"⚑ {flag}")
 

@@ -197,6 +197,59 @@ def fetch_budget(period):
     return budget, {k: round(v, 2) for k, v in unmapped.items() if abs(v) >= TOL}
 
 
+def fetch_feed_expenses(start_ym, end_ym):
+    """{(gl key, (year, month)): amount} summed from the Supabase `expenses`
+    transaction feed, where gl key is the GL code (or account name if none)."""
+    out, offset = defaultdict(float), 0
+    while True:
+        r = requests.get(f"{q.SUPABASE_URL}/rest/v1/expenses", headers=q._sb_headers(), timeout=60,
+                         params=[("select", "gl_code,gl_name,date,amount"), ("order", "id"),
+                                 ("date", f"gte.{date(*start_ym, 1).isoformat()}"),
+                                 ("date", f"lte.{month_end(end_ym).isoformat()}"),
+                                 ("limit", 1000), ("offset", offset)])
+        if r.status_code != 200:
+            raise BuildError(f"expenses feed read failed: {r.status_code} {r.text[:200]}")
+        batch = r.json()
+        for row in batch:
+            y, m = int(row["date"][:4]), int(row["date"][5:7])
+            out[(row["gl_code"] or row["gl_name"], (y, m))] += float(row["amount"] or 0)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    return out
+
+
+RECON_THRESHOLD = 100.0     # flag a GL-month when feed and report differ by more than this
+
+
+def reconcile_feed(act, period):
+    """Books-integrity check: the transaction-level expenses feed against the
+    QBO P&L report, per GL per month, fiscal year to date. The two are pulled
+    by different routes (transaction entities vs the report engine), so drift
+    means the feed is missing or double-counting something — or the books
+    moved after the feed's last sync."""
+    feed = fetch_feed_expenses(period.fy_start, period.ym)
+    report = defaultdict(float)
+    names = {}
+    for aid, vals in act.items():
+        a = q.ACCOUNT_MAP.get(aid)
+        if not a or a["type"] not in EXPENSE_TYPES:
+            continue
+        key = a["code"] or a["full_name"]
+        names[key] = a["full_name"].split(":")[-1]
+        for m in period.months:
+            if m in vals:
+                report[(key, m)] += vals[m]
+    cells = sorted(set(feed) | set(report))
+    drift = [{"gl": k[0], "name": names.get(k[0], ""), "month": f"{MONTH_ABBR[k[1][1]]} {k[1][0]}",
+              "report": round(report.get(k, 0), 2), "feed": round(feed.get(k, 0), 2),
+              "diff": round(feed.get(k, 0) - report.get(k, 0), 2)}
+             for k in cells if abs(feed.get(k, 0) - report.get(k, 0)) > RECON_THRESHOLD]
+    return {"cells": len(cells), "threshold": RECON_THRESHOLD, "drift": drift,
+            "exact": sum(1 for k in cells if abs(feed.get(k, 0) - report.get(k, 0)) < TOL),
+            "report_total": round(sum(report.values()), 2), "feed_total": round(sum(feed.values()), 2)}
+
+
 def flatten_balance_sheet(report, cols):
     """Account rows of a BalanceSheet report, each tagged with the Bridge-style
     section it belongs in, plus QBO's own totals and the computed Net Income line."""
@@ -320,6 +373,8 @@ def build(p):
     cls = {"m": fetch_class_income(p.ym, p.ym), "y": fetch_class_income(p.fy_start, p.ym),
            "pm": fetch_class_income(p.py[p.ym], p.py[p.ym]),
            "py": fetch_class_income(p.py[p.fy_start], p.py[p.ym])}
+    print("  Reconciling the expenses transaction feed to the P&L report ...")
+    recon = reconcile_feed(act, p)
     subtype = {a["Id"]: a.get("AccountSubType") for a in q.qbo_query(
         "SELECT Id, AccountSubType FROM Account WHERE Active IN (true, false) MAXRESULTS 1000").get("Account", [])}
     retained = {i for i, t in subtype.items() if t == "RetainedEarnings"}
@@ -892,10 +947,10 @@ def build(p):
     for x in liab:
         if x[2] < -0.005 and x[0].startswith("2"):
             bullets_bs.append(f"FLAG: {x[1]} ({x[0]}) carries a negative balance of {money(x[2])} — review posting. [Confirm with bookkeeper.]")
-    recon = [x for x in ALL_EXP if x["code"] == "9960"]
-    if recon and abs(recon[0]["y_a"]) >= TOL:
-        text = (f"9960 Reconciliation Discrepancies has {money(recon[0]['y_a'])} of activity {FY} YTD "
-                f"({money(recon[0]['m_a'])} in {p.month_name}) — a books item to clear, not a data error.")
+    gl9960 = [x for x in ALL_EXP if x["code"] == "9960"]
+    if gl9960 and abs(gl9960[0]["y_a"]) >= TOL:
+        text = (f"9960 Reconciliation Discrepancies has {money(gl9960[0]['y_a'])} of activity {FY} YTD "
+                f"({money(gl9960[0]['m_a'])} in {p.month_name}) — a books item to clear, not a data error.")
         bullets_bs.append("FLAG: " + text + " [Confirm with bookkeeper.]")
         flags.append(text)
     for name, amt in bud_unmapped.items():
@@ -940,7 +995,9 @@ def build(p):
         ("Programs", "Program = QBO class. Income is classed by program; expenses are almost entirely unclassed, so the Programs tab "
                      "reports revenue only. Classing direct program costs in QBO would make program-level results possible."),
         ("Verification", "Before upload the workbook is recalculated and every statement total is compared with the total QBO "
-                         "reported (see the Checks tab). The job refuses to upload a package that does not tie."),
+                         "reported (see the Checks tab). The job refuses to upload a package that does not tie. The Checks tab "
+                         "also reconciles the pipeline's transaction-level expenses feed to QBO's P&L by GL and month; differences "
+                         "there are flagged for review but do not block the package, since the statements come from QBO directly."),
         ("Known gaps", "1) Program-level expenses are not available (see Programs). 2) Depreciation is booked at year-end, so "
                        "in-year surplus is before depreciation. 3) Prior-period figures reflect the books as of the build date; "
                        "entries posted to a closed month after a package was issued will change that month in later packages."),
@@ -978,13 +1035,41 @@ def build(p):
     for col in range(1, 7): ws.cell(r, col).border = B_TOP
     summary_cell = f"F{r}"
     r += 2
+    ws.cell(r, 1, "Books integrity — expenses transaction feed vs QBO P&L report").font = F_SECT
+    r += 1
+    ws.cell(r, 1, f"Every expense GL for every month of {FY} to date, compared between the pipeline's transaction feed "
+                  f"(what the Woods dashboard shows) and QBO's own P&L. Differences over ${RECON_THRESHOLD:,.0f} are listed.").font = F_SUB
+    r += 1
+    for label, value, fmt in (("GL-months compared", recon["cells"], "#,##0"),
+                              ("Matching to the penny", recon["exact"], "#,##0"),
+                              (f"Differing by more than ${RECON_THRESHOLD:,.0f}", len(recon["drift"]), "#,##0"),
+                              ("QBO P&L expenses, FY to date", recon["report_total"], '#,##0.00;(#,##0.00);"–"'),
+                              ("Transaction feed expenses, FY to date", recon["feed_total"], '#,##0.00;(#,##0.00);"–"')):
+        ws.cell(r, 2, label).font = F_BODY
+        cc = ws.cell(r, 3, value); cc.font = F_BODY; cc.number_format = fmt
+        r += 1
+    if recon["drift"]:
+        r += 1
+        hdr_row(ws, r, ["GL", "Account / month", "QBO reported", "Feed", "Difference", ""], height=18)
+        r += 1
+        for x in recon["drift"]:
+            ws.cell(r, 1, x["gl"]); ws.cell(r, 2, f"{x['name']} — {x['month']}")
+            ws.cell(r, 3, x["report"]); ws.cell(r, 4, x["feed"]); ws.cell(r, 5, f"=D{r}-C{r}")
+            for col in range(1, 6): ws.cell(r, col).font = F_BODY
+            for col in (3, 4, 5): ws.cell(r, col).number_format = '#,##0.00;(#,##0.00);"–"'
+            r += 1
+        flags.append(f"Expenses feed differs from QBO's P&L by more than ${RECON_THRESHOLD:,.0f} in "
+                     f"{len(recon['drift'])} GL-month(s): " + "; ".join(
+                         f"{x['gl']} {x['month']} ({x['diff']:+,.2f})" for x in recon["drift"][:8])
+                     + (" …" if len(recon["drift"]) > 8 else ""))
+    r += 1
     ws.cell(r, 1, "Flags for review").font = F_SECT
     for text in flags or ["None."]:
         r += 1
         ws.cell(r, 1, text).font = F_BODY
 
     meta = {"period": p.m_name, "fiscal_year": FY, "checks": checks, "flags": flags,
-            "checks_sheet": {"summary": summary_cell},
+            "checks_sheet": {"summary": summary_cell}, "recon": recon,
             "headline": {"income_month": QBO["inc_m"], "expenses_month": QBO["exp_m"], "net_month": QBO["ni_m"],
                          "income_ytd": QBO["inc_y"], "expenses_ytd": QBO["exp_y"], "net_ytd": QBO["ni_y"],
                          "cash": cash_now}}
