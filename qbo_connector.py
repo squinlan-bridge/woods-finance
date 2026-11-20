@@ -1,22 +1,41 @@
 """
 The Woods — QBO Expense Connector
 =================================
-Pulls expense transactions (Purchases + Bills) from The Woods' QuickBooks
-Online company and upserts into the Woods Supabase `expenses` table.
+Pulls every transaction line that posts to an expense-type account in The
+Woods' QuickBooks Online company and mirrors it into the Woods Supabase
+`expenses` table.
 
-Modeled on bridge-finance/qbo_connector.py with one deliberate difference:
-there is NO hardcoded name→GL lookup table. The Woods chart of accounts is
-resolved entirely from the live Account list (AccountRef.value → AcctNum),
-with a numeric-prefix regex as the only fallback. Expense-ness is decided by
-AccountType, not by GL-code numbering, so Woods' numbering scheme doesn't
-matter.
+Entity coverage (amounts are SIGNED — positive = expense, negative = credit):
+    Purchase       checks / card / cash expenses   (+; card refunds −)
+    Bill           vendor bills                    (+)
+    VendorCredit   vendor credits                  (−)
+    JournalEntry   expense-account lines only      (debit +, credit −)
+                   → payroll accruals/reversals and after-the-fact reclasses
+    Deposit        expense-account lines only      (sign flipped)
+                   → refunds and stop-payment credits deposited back
+    Invoice / SalesReceipt / CreditMemo / RefundReceipt
+                   item lines whose item posts to an expense account
+                   → PayPal/PushPay fee lines on Bloomerang-imported
+                     invoices (5222)
 
-Run qbo_auth.py once first to authorize the Woods QBO company.
+The feed is a MIRROR, not an append log: every run re-pulls full history
+since START_DATE, upserts on qbo_id, then deletes QBO-sourced rows that no
+longer exist upstream (deleted transactions, removed lines). Deletion only
+runs when every entity fetched cleanly and is capped by a safety threshold.
+
+There is NO hardcoded name→GL lookup table. The chart of accounts is resolved
+from the live Account list (AccountRef.value → AcctNum); expense-ness is
+decided by AccountType, not GL numbering.
 
 Environment variables (see .env.example):
     SUPABASE_URL, SUPABASE_SERVICE_KEY, QBO_CLIENT_ID, QBO_CLIENT_SECRET
+Optional:
+    WOODS_START_DATE          earliest TxnDate to sync (default 2023-06-01)
+    WOODS_DRY_RUN=1           fetch + parse + report, write nothing
+    WOODS_MAX_STALE_DELETE    override the stale-row deletion cap
 """
 
+import sys
 import os
 import json
 import base64
@@ -182,27 +201,47 @@ def run_query(query, access_token, company_id):
     return response.json().get("QueryResponse", {}), "ok"
 
 
-def _fetch_entity(entity, access_token, company_id):
-    """Fetch all rows of a transaction entity since START_DATE, paginated."""
+class QBOFetchError(Exception):
+    pass
+
+
+# Mutable auth state so one 401 mid-run refreshes once and every later call
+# picks up the new access token.
+AUTH = {"access_token": None, "refresh_token": None, "company_id": None}
+
+
+def qbo_query(query):
+    """run_query with a single refresh-and-retry on 401. Raises on failure."""
+    rows, status = run_query(query, AUTH["access_token"], AUTH["company_id"])
+    if status == "unauthorized":
+        new_access = refresh_access_token(AUTH["refresh_token"])
+        if not new_access:
+            raise QBOFetchError("token refresh failed")
+        AUTH["access_token"] = new_access
+        rows, status = run_query(query, AUTH["access_token"], AUTH["company_id"])
+    if status != "ok" or rows is None:
+        raise QBOFetchError(f"query failed ({status}): {query[:80]}")
+    return rows
+
+
+def _fetch_entity(entity):
+    """Fetch all rows of a transaction entity since START_DATE, paginated.
+
+    Raises QBOFetchError on any failed page — a partial pull must never be
+    mistaken for a complete one, because stale-row deletion keys off it.
+    """
     all_rows, start, page_size = [], 1, 1000
     print(f"  Fetching {entity} transactions...")
     while True:
         query = (f"SELECT * FROM {entity} WHERE TxnDate >= '{START_DATE}' "
                  f"STARTPOSITION {start} MAXRESULTS {page_size}")
-        rows, status = run_query(query, access_token, company_id)
-        if status == "unauthorized":
-            return None, "unauthorized"
-        if status == "error" or rows is None:
-            break
-        batch = rows.get(entity, [])
-        if not batch:
-            break
+        batch = qbo_query(query).get(entity, [])
         all_rows.extend(batch)
-        print(f"    → {len(all_rows)} so far...")
         if len(batch) < page_size:
             break
         start += page_size
-    return all_rows, "ok"
+    print(f"    → {len(all_rows)} {entity} transactions")
+    return all_rows
 
 
 # ── Chart-of-accounts GL mapping ───────────────────────────────────────────
@@ -247,79 +286,255 @@ def resolve_account(account_ref):
     return ACCOUNT_MAP.get(account_ref.get("value", ""))
 
 
+# ── Item → account mapping ─────────────────────────────────────────────────
+# Item-based lines carry an ItemRef, not an AccountRef; the posting account
+# comes from the item. ItemId → {"income": AccountRef, "expense": AccountRef}.
+ITEM_MAP = {}
+
+
+def fetch_item_map():
+    item_map, start = {}, 1
+    while True:
+        batch = qbo_query("SELECT * FROM Item WHERE Active IN (true, false) "
+                          f"STARTPOSITION {start} MAXRESULTS 1000").get("Item", [])
+        for it in batch:
+            item_map[it["Id"]] = {
+                "income":  it.get("IncomeAccountRef") or {},
+                "expense": it.get("ExpenseAccountRef") or {},
+            }
+        if len(batch) < 1000:
+            break
+        start += 1000
+    return item_map
+
+
 # ── Transaction parsers ────────────────────────────────────────────────────
-def _parse_txn(txn, kind, vendor_key):
-    """Shared parser for Purchase and Bill transactions → expense records."""
-    records = []
+def _txn_header(txn):
+    """Common header fields, or None if the transaction has no usable date."""
     txn_date_str = txn.get("TxnDate", "")
-    if not txn_date_str:
-        return records
     try:
         txn_date = date.fromisoformat(txn_date_str)
     except ValueError:
-        return records
+        return None
+    return {
+        "date":   txn_date_str,
+        "fy":     fiscal_year_label(txn_date),
+        "fm":     fiscal_month_index(txn_date),
+        "id":     txn.get("Id", ""),
+        "memo":   (txn.get("PrivateNote") or "").strip(),
+    }
 
-    fy       = fiscal_year_label(txn_date)
-    fm       = fiscal_month_index(txn_date)
-    vendor   = txn.get(vendor_key, {}).get("name", "Unknown")
-    txn_id   = txn.get("Id", "")
-    txn_memo = (txn.get("PrivateNote") or "").strip()
 
-    for idx, line in enumerate(txn.get("Line", [])):
-        detail = line.get("AccountBasedExpenseLineDetail", {})
-        if not detail:
-            continue
-        account_ref = detail.get("AccountRef", {})
-        full_name   = account_ref.get("name", "")
-        amount      = float(line.get("Amount", 0))
-        if amount <= 0 or not full_name:
-            continue
+def _expense_record(qbo_id, hdr, account_ref, amount, vendor, line):
+    """Build one expenses row, or None if the line isn't an expense posting.
 
-        acct = resolve_account(account_ref)
-        if acct:
-            # Authoritative: only keep expense-type accounts.
-            if acct["type"] not in EXPENSE_ACCOUNT_TYPES:
-                continue
-            gl_code  = acct["code"]
-            gl_name  = acct["full_name"] or full_name
-            category = acct["category"]
-            if not gl_code:
-                # Expense account with no AcctNum — try the name prefix.
-                m = re.match(r"^(\d{4,6})\s+", full_name)
-                gl_code = m.group(1) if m else ""
-        else:
-            # Account map miss (shouldn't happen once map is fetched) —
-            # numeric name prefix is the only fallback; unknown types skipped.
+    `amount` is already signed (positive = expense, negative = credit).
+    """
+    amount = round(amount, 2)
+    full_name = account_ref.get("name", "")
+    if amount == 0 or not account_ref:
+        return None
+
+    acct = resolve_account(account_ref)
+    if acct:
+        # Authoritative: only keep expense-type accounts.
+        if acct["type"] not in EXPENSE_ACCOUNT_TYPES:
+            return None
+        gl_code  = acct["code"]
+        gl_name  = acct["full_name"] or full_name
+        category = acct["category"]
+        if not gl_code:
+            # Expense account with no AcctNum — try the name prefix.
             m = re.match(r"^(\d{4,6})\s+", full_name)
-            if not m:
-                continue
-            gl_code, gl_name, category = m.group(1), full_name, "Uncategorized"
+            gl_code = m.group(1) if m else ""
+    else:
+        # Account map miss (shouldn't happen once map is fetched) — numeric
+        # name prefix is the only fallback; unknown types skipped.
+        m = re.match(r"^(\d{4,6})\s+", full_name)
+        if not m:
+            return None
+        gl_code, gl_name, category = m.group(1), full_name, "Uncategorized"
 
-        line_desc = (line.get("Description") or "").strip()
-        memo = line_desc or txn_memo or None
+    line_desc = (line.get("Description") or "").strip()
+    return {
+        "qbo_id":             qbo_id,
+        "date":               hdr["date"],
+        "fiscal_year":        hdr["fy"],
+        "fiscal_month_index": hdr["fm"],
+        "gl_code":            gl_code,
+        "gl_name":            gl_name,
+        "category":           category,
+        "amount":             amount,
+        "vendor":             vendor,
+        "memo":               line_desc or hdr["memo"] or None,
+        "source":             "QBO",
+    }
 
-        records.append({
-            "qbo_id":             f"{kind}_{txn_id}_{idx}",
-            "date":               txn_date_str,
-            "fiscal_year":        fy,
-            "fiscal_month_index": fm,
-            "gl_code":            gl_code,
-            "gl_name":            gl_name,
-            "category":           category,
-            "amount":             amount,
-            "vendor":             vendor,
-            "memo":               memo,
-            "source":             "QBO",
-        })
+
+def _parse_ap_txn(txn, kind, vendor_key, sign):
+    """Purchase / Bill / VendorCredit → expense records.
+
+    Negative lines are kept: a negative line on an expense form is a credit
+    to that account. qbo_id keeps the original `{kind}_{txnId}_{lineIdx}`
+    shape so existing Purchase rows upsert in place.
+    """
+    hdr = _txn_header(txn)
+    if not hdr:
+        return []
+    vendor = (txn.get(vendor_key) or {}).get("name", "Unknown")
+    records = []
+    for idx, line in enumerate(txn.get("Line", [])):
+        detail = line.get("AccountBasedExpenseLineDetail") or {}
+        if detail:
+            account_ref = detail.get("AccountRef") or {}
+        else:
+            # Item-based line: the item's expense account takes the posting.
+            item_id = ((line.get("ItemBasedExpenseLineDetail") or {}).get("ItemRef") or {}).get("value")
+            account_ref = (ITEM_MAP.get(item_id) or {}).get("expense") or {}
+        if not account_ref:
+            continue
+        rec = _expense_record(
+            f"{kind}_{hdr['id']}_{idx}", hdr, account_ref,
+            sign * float(line.get("Amount", 0) or 0), vendor, line)
+        if rec:
+            records.append(rec)
     return records
 
 
 def parse_purchase(txn):
-    return _parse_txn(txn, "Purchase", "EntityRef")
+    # Credit=true is a credit-card refund: money back, so the lines reduce expense.
+    sign = -1 if txn.get("Credit") else 1
+    return _parse_ap_txn(txn, "Purchase", "EntityRef", sign)
 
 
 def parse_bill(txn):
-    return _parse_txn(txn, "Bill", "VendorRef")
+    return _parse_ap_txn(txn, "Bill", "VendorRef", 1)
+
+
+def parse_vendor_credit(txn):
+    return _parse_ap_txn(txn, "VendorCredit", "VendorRef", -1)
+
+
+def parse_journal_entry(txn):
+    """JournalEntry → one record per line that posts to an expense account.
+
+    Debits are positive, credits negative. Credits MUST be kept: reclasses
+    out of an expense account and accrual reversals are credit lines, and
+    dropping them would overstate the account. Lines hitting non-expense
+    accounts (the balance-sheet side of the entry) fall out in
+    _expense_record via the account-type check.
+    """
+    hdr = _txn_header(txn)
+    if not hdr:
+        return []
+    doc = (txn.get("DocNumber") or "").strip()
+    records = []
+    for idx, line in enumerate(txn.get("Line", [])):
+        detail = line.get("JournalEntryLineDetail") or {}
+        if not detail:
+            continue
+        sign = -1 if detail.get("PostingType") == "Credit" else 1
+        entity = (detail.get("Entity") or {}).get("EntityRef") or {}
+        vendor = entity.get("name") or (f"Journal Entry {doc}" if doc else "Journal Entry")
+        rec = _expense_record(
+            f"je_{hdr['id']}_{line.get('Id') or idx}", hdr,
+            detail.get("AccountRef") or {},
+            sign * float(line.get("Amount", 0) or 0), vendor, line)
+        if rec:
+            records.append(rec)
+    return records
+
+
+def parse_deposit(txn):
+    """Deposit → records for lines that post to an expense account.
+
+    A deposit line CREDITS its account, so the expense sign is flipped:
+    a negative line (processor fee netted out of a deposit) is a positive
+    expense; a positive line (refund, stop-payment credit) reduces expense.
+    Lines that only pull payments out of Undeposited Funds have no AccountRef
+    and are skipped.
+    """
+    hdr = _txn_header(txn)
+    if not hdr:
+        return []
+    records = []
+    for idx, line in enumerate(txn.get("Line", [])):
+        detail = line.get("DepositLineDetail") or {}
+        account_ref = detail.get("AccountRef") or {}
+        if not account_ref:
+            continue
+        entity = detail.get("Entity") or {}
+        vendor = entity.get("name") or (entity.get("EntityRef") or {}).get("name") or "Deposit"
+        rec = _expense_record(
+            f"dep_{hdr['id']}_{line.get('Id') or idx}", hdr, account_ref,
+            -float(line.get("Amount", 0) or 0), vendor, line)
+        if rec:
+            records.append(rec)
+    return records
+
+
+def _parse_sales_txn(txn, prefix, sign):
+    """Sales forms → records for item lines whose item posts to an EXPENSE
+    account (income-account lines fall out on the account-type check).
+
+    A sales line credits the item's account, so on Invoice/SalesReceipt a
+    negative fee line is a positive expense (sign=-1); CreditMemo and
+    RefundReceipt reverse that (sign=+1).
+    """
+    hdr = _txn_header(txn)
+    if not hdr:
+        return []
+    customer = (txn.get("CustomerRef") or {}).get("name", "Unknown")
+    records = []
+    for idx, line in enumerate(txn.get("Line", [])):
+        item_id = ((line.get("SalesItemLineDetail") or {}).get("ItemRef") or {}).get("value")
+        account_ref = (ITEM_MAP.get(item_id) or {}).get("income") or {}
+        if not account_ref:
+            continue
+        rec = _expense_record(
+            f"{prefix}_{hdr['id']}_{line.get('Id') or idx}", hdr, account_ref,
+            sign * float(line.get("Amount", 0) or 0), customer, line)
+        if rec:
+            records.append(rec)
+    return records
+
+
+# entity → parser. Order is display-only.
+ENTITY_PARSERS = [
+    ("Purchase",     parse_purchase),
+    ("Bill",         parse_bill),
+    ("VendorCredit", parse_vendor_credit),
+    ("JournalEntry", parse_journal_entry),
+    ("Deposit",      parse_deposit),
+    ("Invoice",       lambda t: _parse_sales_txn(t, "inv", -1)),
+    ("SalesReceipt",  lambda t: _parse_sales_txn(t, "sr",  -1)),
+    ("CreditMemo",    lambda t: _parse_sales_txn(t, "cm",   1)),
+    ("RefundReceipt", lambda t: _parse_sales_txn(t, "rr",   1)),
+]
+
+
+def fetch_and_parse_all():
+    """Pull every entity and parse to expense records. Raises on any failure."""
+    global ITEM_MAP
+    ITEM_MAP = fetch_item_map()
+    print(f"  → {len(ITEM_MAP)} items mapped")
+    all_records = []
+    for entity, parser in ENTITY_PARSERS:
+        txns = _fetch_entity(entity)
+        recs = []
+        for txn in txns:
+            recs.extend(parser(txn))
+        print(f"    → {len(recs)} expense lines from {entity}")
+        all_records.extend(recs)
+    # Belt and braces: a qbo_id may appear only once per upsert batch.
+    seen, unique = set(), []
+    for r in all_records:
+        if r["qbo_id"] in seen:
+            print(f"  ⚠ duplicate qbo_id skipped: {r['qbo_id']}")
+            continue
+        seen.add(r["qbo_id"])
+        unique.append(r)
+    return unique
 
 
 # ── Supabase upserter ──────────────────────────────────────────────────────
@@ -347,80 +562,136 @@ def upsert_to_supabase(records, table="expenses", conflict="qbo_id", batch_size=
     return inserted
 
 
+# ── Stale-row deletion (mirror semantics) ──────────────────────────────────
+def _sb_headers(extra=None):
+    h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    h.update(extra or {})
+    return h
+
+
+def fetch_existing_qbo_ids():
+    """All QBO-sourced qbo_ids currently in Supabase within the sync window."""
+    ids, offset, page = [], 0, 1000
+    while True:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/expenses",
+            headers=_sb_headers(),
+            params={"select": "qbo_id", "source": "eq.QBO", "date": f"gte.{START_DATE}",
+                    "qbo_id": "not.is.null", "order": "id", "limit": page, "offset": offset},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"could not list existing qbo_ids: {r.status_code} {r.text[:200]}")
+        batch = r.json()
+        ids.extend(row["qbo_id"] for row in batch)
+        if len(batch) < page:
+            break
+        offset += page
+    return ids
+
+
+def delete_stale_rows(fetched_ids, dry_run=False):
+    """Delete QBO rows in Supabase that QBO no longer returns.
+
+    Covers deleted/voided-to-zero transactions and removed lines. Capped: if
+    more rows than the threshold would go, nothing is deleted and the run
+    fails loudly — that pattern means a bad pull, not bookkeeping.
+    """
+    existing = fetch_existing_qbo_ids()
+    stale = sorted(set(existing) - set(fetched_ids))
+    if not stale:
+        print("  ✓ No stale rows.")
+        return 0
+    cap = int(os.environ.get("WOODS_MAX_STALE_DELETE") or max(50, len(existing) // 50))
+    print(f"  {len(stale)} stale row(s) no longer in QBO (cap {cap}): {stale[:10]}{' …' if len(stale) > 10 else ''}")
+    if len(stale) > cap:
+        raise RuntimeError(
+            f"{len(stale)} stale rows exceeds the safety cap of {cap} — nothing deleted. "
+            "If this is a real cleanup, re-run with WOODS_MAX_STALE_DELETE set higher.")
+    if dry_run:
+        print("  (dry run — not deleting)")
+        return 0
+    deleted = 0
+    for i in range(0, len(stale), 100):
+        chunk = stale[i:i + 100]
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/expenses",
+            headers=_sb_headers({"Prefer": "return=minimal"}),
+            params={"source": "eq.QBO", "qbo_id": f"in.({','.join(chunk)})"},
+            timeout=30,
+        )
+        if r.status_code not in (200, 204):
+            raise RuntimeError(f"stale-row delete failed: {r.status_code} {r.text[:200]}")
+        deleted += len(chunk)
+    print(f"  ✓ Deleted {deleted} stale row(s).")
+    return deleted
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
+    """Returns a process exit code — non-zero on any failure so the workflow
+    heartbeat records `error` instead of a false `ok`."""
     print("=" * 60)
     print("The Woods — QBO Expense Connector")
     print("=" * 60)
+    dry_run = os.environ.get("WOODS_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
     missing = [v for v in ("SUPABASE_URL", "QBO_CLIENT_ID", "QBO_CLIENT_SECRET") if not os.environ.get(v)]
     if not SUPABASE_KEY:
         missing.append("SUPABASE_SERVICE_KEY")
     if missing:
         print(f"\n⚠  Missing environment variables: {', '.join(missing)}")
-        return
+        return 1
 
     tokens = load_tokens()
     if not tokens:
-        return
-    access_token  = tokens["access_token"]
-    refresh_token = tokens["refresh_token"]
-    company_id    = tokens["company_id"]
-    print(f"\nCompany ID: {company_id}")
-    print(f"Date range: {START_DATE} to present\n")
+        return 1
+    AUTH.update(access_token=tokens["access_token"],
+                refresh_token=tokens["refresh_token"],
+                company_id=tokens["company_id"])
+    print(f"\nCompany ID: {AUTH['company_id']}")
+    print(f"Date range: {START_DATE} to present{'   [DRY RUN]' if dry_run else ''}\n")
 
     # Chart of accounts FIRST — parsing depends on it for type/category/code.
     global ACCOUNT_MAP
-    ACCOUNT_MAP, status = fetch_account_map(access_token, company_id)
+    ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
     if status == "unauthorized":
-        access_token = refresh_access_token(refresh_token)
-        if not access_token:
-            return
-        ACCOUNT_MAP, status = fetch_account_map(access_token, company_id)
+        new_access = refresh_access_token(AUTH["refresh_token"])
+        if not new_access:
+            return 1
+        AUTH["access_token"] = new_access
+        ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
+    if status != "ok" or not ACCOUNT_MAP:
+        print(f"  ✗ Could not fetch the chart of accounts ({status}).")
+        return 1
     print(f"  → {len(ACCOUNT_MAP)} accounts mapped "
           f"({sum(1 for v in ACCOUNT_MAP.values() if v['code'])} with AcctNum)")
 
-    purchases, status = _fetch_entity("Purchase", access_token, company_id)
-    if status == "unauthorized":
-        access_token = refresh_access_token(refresh_token)
-        if not access_token:
-            return
-        purchases, status = _fetch_entity("Purchase", access_token, company_id)
-    purchases = purchases or []
-    print(f"  → {len(purchases)} Purchase transactions fetched")
-
-    bills, status = _fetch_entity("Bill", access_token, company_id)
-    if status == "unauthorized":
-        access_token = refresh_access_token(refresh_token)
-        if not access_token:
-            return
-        bills, status = _fetch_entity("Bill", access_token, company_id)
-    bills = bills or []
-    print(f"  → {len(bills)} Bill transactions fetched")
-
-    print("\nParsing transactions...")
-    all_records = []
-    for txn in purchases:
-        all_records.extend(parse_purchase(txn))
-    for txn in bills:
-        all_records.extend(parse_bill(txn))
-    print(f"  → {len(all_records)} expense line items parsed")
+    try:
+        all_records = fetch_and_parse_all()
+    except QBOFetchError as e:
+        print(f"\n✗ QBO fetch failed — nothing written, nothing deleted: {e}")
+        return 1
+    print(f"\n  → {len(all_records)} expense line items parsed")
 
     if not all_records:
-        print("\n  No expense records found. Check the date range and that the")
-        print("  Woods QBO company has Purchase/Bill transactions.")
-        return
-
-    print("\n--- Sample records (first 5) ---")
-    for r in all_records[:5]:
-        print(f"  {r['date']} | {r['gl_name'][:34]:34} | {r['category'][:18]:18} | ${r['amount']:>10,.2f} | {r['vendor'][:20]}")
+        print("\n  ✗ No expense records found — treating as a failed pull.")
+        return 1
 
     from collections import Counter
     fy_counts = Counter(r["fiscal_year"] for r in all_records)
-    print(f"\nRecords by fiscal year: {dict(sorted(fy_counts.items()))}")
+    print(f"Records by fiscal year: {dict(sorted(fy_counts.items()))}")
     no_code = sum(1 for r in all_records if not r["gl_code"])
     if no_code:
         print(f"⚠ {no_code} records have NO gl_code (expense account without AcctNum in QBO)")
+
+    if dry_run:
+        print("\nDRY RUN → no upsert.")
+        try:
+            delete_stale_rows([r["qbo_id"] for r in all_records], dry_run=True)
+        except RuntimeError as e:
+            print(f"  ⚠ {e}")
+        return 0
 
     if os.environ.get("CI", "").lower() == "true":
         print("\nCI=true → auto-confirming upsert.")
@@ -428,12 +699,24 @@ def main():
         confirm = input("\nProceed with upsert to Supabase? (yes/no): ").strip().lower()
         if confirm != "yes":
             print("Aborted. No data was written.")
-            return
+            return 0
 
     print("\nUpserting to Supabase...")
     inserted = upsert_to_supabase(all_records)
+    if inserted != len(all_records):
+        print(f"\n✗ Only {inserted}/{len(all_records)} records upserted — skipping stale-row deletion.")
+        return 1
+
+    print("\nChecking for stale rows...")
+    try:
+        delete_stale_rows([r["qbo_id"] for r in all_records])
+    except RuntimeError as e:
+        print(f"  ✗ {e}")
+        return 1
+
     print(f"\n✓ Woods QBO connector complete. {inserted}/{len(all_records)} records loaded.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
