@@ -1,0 +1,53 @@
+name: Monthly Woods Financial Package
+
+# Builds the Woods monthly financial package entirely in the cloud on the 3rd:
+# fresh pulls from the QBO Reports API -> build_woods_package.py -> LibreOffice
+# recalc -> verify every statement total against QBO -> upload to the
+# SharePoint Finance library, "The Woods/Monthly Packages". Nothing uploads if
+# verification fails. A cloud Claude task reviews the uploaded package
+# afterwards and sends Shane the summary. Manual runs can override the period.
+#
+# Runs 15 minutes after the Bridge board package so the two jobs don't
+# compete for the shared Actions minutes at the same moment.
+
+on:
+  schedule:
+    - cron: "45 18 3 * *"   # 3rd of the month, 12:45 PM CST (1:45 PM CDT)
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Calendar year of the period to build (blank = previous month)"
+        required: false
+      month:
+        description: "Calendar month 1-12 (blank = previous month)"
+        required: false
+
+jobs:
+  woods-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get update -q
+          sudo apt-get install -y -q libreoffice-calc
+
+      - name: Build, verify and upload the Woods package
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+          MS_TENANT_ID:         ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID:         ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET:     ${{ secrets.MS_CLIENT_SECRET }}
+          SHAREPOINT_SITE_ID:   ${{ secrets.SHAREPOINT_SITE_ID }}
+          WP_YEAR:              ${{ inputs.year }}
+          WP_MONTH:             ${{ inputs.month }}
+        run: python3 monthly_package/package_job.py
