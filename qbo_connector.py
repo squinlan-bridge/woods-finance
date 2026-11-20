@@ -244,6 +244,116 @@ def _fetch_entity(entity):
     return all_rows
 
 
+def qbo_report(name, **params):
+    """Fetch a QBO report (ProfitAndLoss, BalanceSheet, ...) as JSON.
+
+    Shared by the report-based feeds. One refresh-and-retry on 401; raises
+    QBOFetchError on anything else so callers never store a partial pull.
+    """
+    params.setdefault("minorversion", "65")
+    url = f"{QBO_BASE}/v3/company/{AUTH['company_id']}/reports/{name}"
+    for attempt in (1, 2):
+        r = requests.get(url, params=params, timeout=120,
+                         headers={"Authorization": f"Bearer {AUTH['access_token']}",
+                                  "Accept": "application/json"})
+        if r.status_code == 401 and attempt == 1:
+            new_access = refresh_access_token(AUTH["refresh_token"])
+            if not new_access:
+                raise QBOFetchError("token refresh failed")
+            AUTH["access_token"] = new_access
+            continue
+        if r.status_code != 200:
+            raise QBOFetchError(f"{name} report failed: {r.status_code} {r.text[:200]}")
+        return r.json()
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+_COL_RE = re.compile(r"^([A-Z][a-z]{2})\s+(?:(\d{1,2})-(\d{1,2}),\s+)?(\d{4})$")
+
+
+def report_month_columns(report, complete_only=False):
+    """Column index → (year, month) for a report summarized by month.
+
+    QBO titles a full month "Oct 2026" and an in-progress one
+    "Nov 1-20, 2026". `complete_only` drops the in-progress month (balance
+    feeds store month-END balances only). The "Total" column never matches.
+    """
+    cols = {}
+    for i, col in enumerate(report.get("Columns", {}).get("Column", [])):
+        m = _COL_RE.match((col.get("ColTitle") or "").strip())
+        if not m or m.group(1) not in _MONTHS:
+            continue
+        year, month = int(m.group(4)), _MONTHS[m.group(1)]
+        if m.group(3):
+            import calendar
+            partial = (int(m.group(2)), int(m.group(3))) != (1, calendar.monthrange(year, month)[1])
+            if partial and complete_only:
+                continue
+        cols[i] = (year, month)
+    return cols
+
+
+def report_values(coldata, cols):
+    """{(year, month): float} for one report row; blank cells are absent."""
+    out = {}
+    for i, ym in cols.items():
+        raw = (coldata[i].get("value") or "").strip() if i < len(coldata) else ""
+        if raw:
+            out[ym] = float(raw.replace(",", ""))
+    return out
+
+
+def fiscal_year_starts(today=None):
+    """June-1 fiscal-year start dates from START_DATE's fiscal year to today."""
+    today = today or date.today()
+    first = date.fromisoformat(START_DATE)
+    year = first.year if first.month >= FY_START_MONTH else first.year - 1
+    starts = []
+    while date(year, FY_START_MONTH, 1) <= today:
+        starts.append(max(date(year, FY_START_MONTH, 1), first))
+        year += 1
+    return starts
+
+
+def start_session():
+    """Validate env, load tokens into AUTH and fetch the chart of accounts.
+    Returns False (after printing why) if the run cannot proceed."""
+    global ACCOUNT_MAP
+    missing = [v for v in ("SUPABASE_URL", "QBO_CLIENT_ID", "QBO_CLIENT_SECRET") if not os.environ.get(v)]
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_SERVICE_KEY")
+    if missing:
+        print(f"\n⚠  Missing environment variables: {', '.join(missing)}")
+        return False
+    tokens = load_tokens()
+    if not tokens:
+        return False
+    AUTH.update(access_token=tokens["access_token"],
+                refresh_token=tokens["refresh_token"],
+                company_id=tokens.get("company_id") or COMPANY_ID)
+    print(f"\nCompany ID: {AUTH['company_id']}")
+
+    # Chart of accounts FIRST — parsing depends on it for type/category/code.
+    ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
+    if status == "unauthorized":
+        new_access = refresh_access_token(AUTH["refresh_token"])
+        if not new_access:
+            return False
+        AUTH["access_token"] = new_access
+        ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
+    if status != "ok" or not ACCOUNT_MAP:
+        print(f"  ✗ Could not fetch the chart of accounts ({status}).")
+        return False
+    print(f"  → {len(ACCOUNT_MAP)} accounts mapped "
+          f"({sum(1 for v in ACCOUNT_MAP.values() if v['code'])} with AcctNum)")
+    return True
+
+
+def is_dry_run():
+    return os.environ.get("WOODS_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+
 # ── Chart-of-accounts GL mapping ───────────────────────────────────────────
 # AccountId → {code, full_name, type, category}. Populated in main(); the
 # parsers consult it as the AUTHORITATIVE source for GL code, name, category
@@ -569,41 +679,41 @@ def _sb_headers(extra=None):
     return h
 
 
-def fetch_existing_qbo_ids():
-    """All QBO-sourced qbo_ids currently in Supabase within the sync window."""
+def fetch_existing_ids(table, id_col, filters):
+    """All ids currently in a Supabase table within `filters` (PostgREST params)."""
     ids, offset, page = [], 0, 1000
     while True:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/expenses",
-            headers=_sb_headers(),
-            params={"select": "qbo_id", "source": "eq.QBO", "date": f"gte.{START_DATE}",
-                    "qbo_id": "not.is.null", "order": "id", "limit": page, "offset": offset},
-            timeout=30,
-        )
+        params = {"select": id_col, id_col: "not.is.null", "order": id_col,
+                  "limit": page, "offset": offset}
+        params.update(filters)
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers(),
+                         params=params, timeout=30)
         if r.status_code != 200:
-            raise RuntimeError(f"could not list existing qbo_ids: {r.status_code} {r.text[:200]}")
+            raise RuntimeError(f"could not list existing {table} ids: {r.status_code} {r.text[:200]}")
         batch = r.json()
-        ids.extend(row["qbo_id"] for row in batch)
+        ids.extend(row[id_col] for row in batch)
         if len(batch) < page:
             break
         offset += page
     return ids
 
 
-def delete_stale_rows(fetched_ids, dry_run=False):
-    """Delete QBO rows in Supabase that QBO no longer returns.
+def delete_stale(table, id_col, fetched_ids, filters, dry_run=False):
+    """Delete rows in `table` (within `filters`) that the source no longer returns.
 
-    Covers deleted/voided-to-zero transactions and removed lines. Capped: if
-    more rows than the threshold would go, nothing is deleted and the run
-    fails loudly — that pattern means a bad pull, not bookkeeping.
+    This is what makes a feed a mirror: deleted transactions, removed lines
+    and accounts that dropped off a report all self-heal. Capped: if more
+    rows than the threshold would go, nothing is deleted and the run fails
+    loudly — that pattern means a bad pull, not bookkeeping.
     """
-    existing = fetch_existing_qbo_ids()
+    existing = fetch_existing_ids(table, id_col, filters)
     stale = sorted(set(existing) - set(fetched_ids))
     if not stale:
         print("  ✓ No stale rows.")
         return 0
     cap = int(os.environ.get("WOODS_MAX_STALE_DELETE") or max(50, len(existing) // 50))
-    print(f"  {len(stale)} stale row(s) no longer in QBO (cap {cap}): {stale[:10]}{' …' if len(stale) > 10 else ''}")
+    print(f"  {len(stale)} stale {table} row(s) no longer in QBO (cap {cap}): "
+          f"{stale[:10]}{' …' if len(stale) > 10 else ''}")
     if len(stale) > cap:
         raise RuntimeError(
             f"{len(stale)} stale rows exceeds the safety cap of {cap} — nothing deleted. "
@@ -614,17 +724,22 @@ def delete_stale_rows(fetched_ids, dry_run=False):
     deleted = 0
     for i in range(0, len(stale), 100):
         chunk = stale[i:i + 100]
-        r = requests.delete(
-            f"{SUPABASE_URL}/rest/v1/expenses",
-            headers=_sb_headers({"Prefer": "return=minimal"}),
-            params={"source": "eq.QBO", "qbo_id": f"in.({','.join(chunk)})"},
-            timeout=30,
-        )
+        params = {id_col: f"in.({','.join(chunk)})"}
+        params.update(filters)
+        r = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}",
+                            headers=_sb_headers({"Prefer": "return=minimal"}),
+                            params=params, timeout=30)
         if r.status_code not in (200, 204):
             raise RuntimeError(f"stale-row delete failed: {r.status_code} {r.text[:200]}")
         deleted += len(chunk)
     print(f"  ✓ Deleted {deleted} stale row(s).")
     return deleted
+
+
+def delete_stale_rows(fetched_ids, dry_run=False):
+    """Expenses feed: QBO-sourced rows inside the sync window."""
+    return delete_stale("expenses", "qbo_id", fetched_ids,
+                        {"source": "eq.QBO", "date": f"gte.{START_DATE}"}, dry_run)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -634,38 +749,10 @@ def main():
     print("=" * 60)
     print("The Woods — QBO Expense Connector")
     print("=" * 60)
-    dry_run = os.environ.get("WOODS_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
-
-    missing = [v for v in ("SUPABASE_URL", "QBO_CLIENT_ID", "QBO_CLIENT_SECRET") if not os.environ.get(v)]
-    if not SUPABASE_KEY:
-        missing.append("SUPABASE_SERVICE_KEY")
-    if missing:
-        print(f"\n⚠  Missing environment variables: {', '.join(missing)}")
+    dry_run = is_dry_run()
+    if not start_session():
         return 1
-
-    tokens = load_tokens()
-    if not tokens:
-        return 1
-    AUTH.update(access_token=tokens["access_token"],
-                refresh_token=tokens["refresh_token"],
-                company_id=tokens["company_id"])
-    print(f"\nCompany ID: {AUTH['company_id']}")
     print(f"Date range: {START_DATE} to present{'   [DRY RUN]' if dry_run else ''}\n")
-
-    # Chart of accounts FIRST — parsing depends on it for type/category/code.
-    global ACCOUNT_MAP
-    ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
-    if status == "unauthorized":
-        new_access = refresh_access_token(AUTH["refresh_token"])
-        if not new_access:
-            return 1
-        AUTH["access_token"] = new_access
-        ACCOUNT_MAP, status = fetch_account_map(AUTH["access_token"], AUTH["company_id"])
-    if status != "ok" or not ACCOUNT_MAP:
-        print(f"  ✗ Could not fetch the chart of accounts ({status}).")
-        return 1
-    print(f"  → {len(ACCOUNT_MAP)} accounts mapped "
-          f"({sum(1 for v in ACCOUNT_MAP.values() if v['code'])} with AcctNum)")
 
     try:
         all_records = fetch_and_parse_all()

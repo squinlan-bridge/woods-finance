@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Write a per-feed heartbeat row to Supabase sync_heartbeat.
 # Usage: heartbeat.sh <feed> <status> [note]
-#   feed:    gl_accounts | expenses | budget
+#   feed:    gl_accounts | expenses | budget | income_monthly | balance_monthly
 #   status:  ok | error
 #   note:    optional free text
 set -euo pipefail

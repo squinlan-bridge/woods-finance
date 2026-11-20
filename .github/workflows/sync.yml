@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── QBO feeds (chart of accounts, expenses, budget) ─────────────────────
+  # ── QBO feeds (chart of accounts, expenses, budget, income, balance) ────
   # All share the same OAuth token (Supabase-persisted). One job so token
   # refresh happens once. Each connector wrapped with `continue-on-error:
   # true` so a mid-job failure does NOT skip sibling steps — every heartbeat
@@ -108,6 +108,59 @@ jobs:
             bash .github/scripts/heartbeat.sh budget ok "run $RUN_ID"
           else
             bash .github/scripts/heartbeat.sh budget error "run $RUN_ID outcome=$OUTCOME"
+          fi
+
+      # Report-based feeds: pulled from the QBO Reports API, so they tie to the
+      # camp's financial statements by construction. Each fails (→ error
+      # heartbeat) rather than store numbers that don't foot to the report.
+      - name: Sync income (P&L report)
+        id: sync-income
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_income_connector.py
+
+      - name: Heartbeat — income_monthly
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OUTCOME:              ${{ steps.sync-income.outcome }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            bash .github/scripts/heartbeat.sh income_monthly ok "run $RUN_ID"
+          else
+            bash .github/scripts/heartbeat.sh income_monthly error "run $RUN_ID outcome=$OUTCOME"
+          fi
+
+      - name: Sync balance sheet (BalanceSheet report)
+        id: sync-balance
+        continue-on-error: true
+        env:
+          CI: 'true'
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          QBO_CLIENT_ID:        ${{ secrets.QBO_CLIENT_ID }}
+          QBO_CLIENT_SECRET:    ${{ secrets.QBO_CLIENT_SECRET }}
+        run: python3 qbo_balance_connector.py
+
+      - name: Heartbeat — balance_monthly
+        if: always()
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OUTCOME:              ${{ steps.sync-balance.outcome }}
+          RUN_ID:               ${{ github.run_id }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            bash .github/scripts/heartbeat.sh balance_monthly ok "run $RUN_ID"
+          else
+            bash .github/scripts/heartbeat.sh balance_monthly error "run $RUN_ID outcome=$OUTCOME"
           fi
 
   # ── Freshness check — runs last, always. Fails the workflow if any feed is
